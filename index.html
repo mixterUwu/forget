@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>TARKOV 2D • Extracción y Auto-Aim</title>
+  <title>TARKOV 2D • Misma Velocidad</title>
   <style>
     * {
       margin: 0;
@@ -97,6 +97,20 @@
       font-weight: bold;
       z-index: 10;
     }
+    .cooldown-indicator {
+      position: absolute;
+      bottom: 100px;
+      right: 16px;
+      background: rgba(0,0,0,0.8);
+      border: 1px solid #e74c3c;
+      color: #e74c3c;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: bold;
+      z-index: 10;
+      display: none;
+    }
     .controls {
       position: absolute;
       bottom: 18px;
@@ -144,15 +158,21 @@
       border: 2px solid #e74c3c;
       color: white;
       font-weight: bold;
-      font-size: 20px;
+      font-size: 18px;
       display: flex;
       align-items: center;
       justify-content: center;
       box-shadow: 0 0 18px #e74c3c80;
       transition: 0.08s;
       touch-action: manipulation;
+      position: relative;
     }
-    .fire-btn:active {
+    .fire-btn.cooldown {
+      background: #7f8c8d;
+      border-color: #95a5a6;
+      box-shadow: 0 0 5px #7f8c8d80;
+    }
+    .fire-btn:active:not(.cooldown) {
       transform: scale(0.88);
       background: #e74c3c;
     }
@@ -185,6 +205,29 @@
       z-index: 15;
       display: none;
     }
+    .minimap-container {
+      position: absolute;
+      top: 60px;
+      right: 10px;
+      width: 100px;
+      height: 100px;
+      background: rgba(0,0,0,0.8);
+      border: 2px solid #5a6b5a;
+      border-radius: 12px;
+      z-index: 12;
+      backdrop-filter: blur(3px);
+      overflow: hidden;
+    }
+    .minimap-label {
+      position: absolute;
+      top: 55px;
+      right: 14px;
+      color: #aaa;
+      font-size: 8px;
+      z-index: 13;
+      pointer-events: none;
+      font-weight: bold;
+    }
   </style>
 </head>
 <body>
@@ -199,9 +242,16 @@
     <div class="extract-timer" id="extractDisplay">🚁 0%</div>
   </div>
 
-  <div class="ammo-indicator">
-    🔫 <span id="ammoCount">30</span>
+  <div class="minimap-container">
+    <canvas id="minimapCanvas" width="100" height="100"></canvas>
   </div>
+  <div class="minimap-label">MAPA</div>
+
+  <div class="ammo-indicator">
+    🔫 <span id="ammoCount">50</span>
+  </div>
+
+  <div class="cooldown-indicator" id="cooldownDisplay">⏳ RECARGANDO</div>
 
   <div class="extract-msg" id="extractMessage">⏳ EXTRAYENDO...</div>
 
@@ -220,76 +270,182 @@
   (function() {
     const canvas = document.getElementById('gameCanvas');
     const ctx = canvas.getContext('2d');
+    const minimapCanvas = document.getElementById('minimapCanvas');
+    const minimapCtx = minimapCanvas.getContext('2d');
 
-    // Dimensiones lógicas fijas
     const W = 400, H = 710;
     canvas.width = W;
     canvas.height = H;
 
-    // Estado global
+    const SHOOT_COOLDOWN = 400;
+    const BASE_SPEED = 4.5; // Misma velocidad para jugador y enemigos
+
     const state = {
-      hp: 100,
-      maxHp: 100,
-      ammo: 30,
-      mapW: 1400,
-      mapH: 1400,
-      zoom: 1.9,        // cámara más cercana
-      extractProgress: 0, // 0 a 100
+      hp: 200,
+      maxHp: 200,
+      ammo: 60,
+      mapW: 1600,
+      mapH: 1600,
+      zoom: 2.0,
+      extractProgress: 0,
       extracting: false,
       gameOver: false,
-      victory: false
+      victory: false,
+      enemySpawnTimer: 0,
+      spawnInterval: 200,
+      lastShootTime: 0,
+      cooldownActive: false
     };
 
-    // Jugador
     const player = {
-      x: 700, y: 700,
-      radius: 11,
+      x: 800, y: 800,
+      radius: 12,
       angle: 0,
-      speed: 2.8,
+      speed: BASE_SPEED,
       vx: 0, vy: 0
     };
 
-    // Cámara
     const camera = { x: 0, y: 0 };
 
-    // Enemigos iniciales
-    let enemies = [
-      { x: 500, y: 600, hp: 45, maxHp: 45, speed: 1.1, radius: 12 },
-      { x: 900, y: 500, hp: 45, maxHp: 45, speed: 1.0, radius: 12 },
-      { x: 750, y: 350, hp: 55, maxHp: 55, speed: 0.9, radius: 12 },
-      { x: 400, y: 850, hp: 45, maxHp: 45, speed: 1.2, radius: 12 }
-    ];
+    const vegetation = [];
+    function generateVegetation() {
+      for (let i = 0; i < 150; i++) {
+        vegetation.push({
+          x: Math.random() * state.mapW,
+          y: Math.random() * state.mapH,
+          type: Math.random() < 0.6 ? 'tree' : 'bush',
+          radius: Math.random() < 0.6 ? 14 + Math.random() * 10 : 8 + Math.random() * 8
+        });
+      }
+    }
+    generateVegetation();
+
+    let enemies = [];
+    function spawnInitialEnemies() {
+      for (let i = 0; i < 12; i++) {
+        let ex, ey;
+        do {
+          ex = 200 + Math.random() * (state.mapW - 400);
+          ey = 200 + Math.random() * (state.mapH - 400);
+        } while (Math.hypot(ex - player.x, ey - player.y) < 400);
+        enemies.push({
+          x: ex, y: ey,
+          hp: 60 + Math.floor(Math.random() * 40),
+          maxHp: 60,
+          speed: BASE_SPEED - 2.5,
+          radius: 13
+        });
+      }
+    }
+    spawnInitialEnemies();
 
     let bullets = [];
     let lootDrops = [];
     let floatingTexts = [];
 
-    // Extracción: zona fija
     const extractionZone = {
-      x: 1050,
-      y: 1050,
-      radius: 55
+      x: 1200,
+      y: 1200,
+      radius: 70
     };
 
-    // Joystick
     const joystickBase = document.getElementById('joystickBase');
     const joystickThumb = document.getElementById('joystickThumb');
     let joystickActive = false;
     let joystickCenter = { x: 0, y: 0 };
 
-    // Disparo
     const fireBtn = document.getElementById('fireButton');
+    const cooldownDisplay = document.getElementById('cooldownDisplay');
     let firing = false;
-    let lastShotTime = 0;
+    let cooldownTimer = null;
 
-    // Loot
     const lootBtn = document.getElementById('lootButton');
     let activeLootIndex = -1;
 
-    // ---------- JOYSTICK ----------
+    function isOnScreen(x, y, margin = 70) {
+      const screenLeft = camera.x - margin;
+      const screenTop = camera.y - margin;
+      const screenRight = camera.x + (W / state.zoom) + margin;
+      const screenBottom = camera.y + (H / state.zoom) + margin;
+      return x > screenLeft && x < screenRight && y > screenTop && y < screenBottom;
+    }
+
+    function spawnEnemyNearPlayer() {
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 400 + Math.random() * 300;
+        const ex = player.x + Math.cos(angle) * dist;
+        const ey = player.y + Math.sin(angle) * dist;
+        
+        if (!isOnScreen(ex, ey, 50) && 
+            ex > 40 && ex < state.mapW - 40 && 
+            ey > 40 && ey < state.mapH - 40) {
+          enemies.push({
+            x: ex, y: ey,
+            hp: 55 + Math.floor(Math.random() * 35),
+            maxHp: 55,
+            speed: BASE_SPEED,
+            radius: 13
+          });
+          return true;
+        }
+      }
+      const edgeAngle = Math.random() * Math.PI * 2;
+      const ex = player.x + Math.cos(edgeAngle) * 500;
+      const ey = player.y + Math.sin(edgeAngle) * 500;
+      if (ex > 40 && ex < state.mapW - 40 && ey > 40 && ey < state.mapH - 40) {
+        enemies.push({
+          x: ex, y: ey,
+          hp: 55 + Math.floor(Math.random() * 35),
+          maxHp: 55,
+          speed: BASE_SPEED,
+          radius: 13
+        });
+        return true;
+      }
+      return false;
+    }
+
+    function updateEnemySpawning() {
+      if (state.gameOver) return;
+      
+      state.enemySpawnTimer++;
+      const currentInterval = state.extracting ? 130 : state.spawnInterval;
+      const enemiesToSpawn = 6 + Math.floor(Math.random() * 2);
+      
+      if (state.enemySpawnTimer >= currentInterval && enemies.length < 25) {
+        state.enemySpawnTimer = 0;
+        let spawned = 0;
+        for (let i = 0; i < enemiesToSpawn; i++) {
+          if (spawnEnemyNearPlayer()) spawned++;
+        }
+        if (spawned === 0) state.enemySpawnTimer = currentInterval - 25;
+      }
+    }
+
+    function startCooldown() {
+      state.cooldownActive = true;
+      state.lastShootTime = Date.now();
+      fireBtn.classList.add('cooldown');
+      cooldownDisplay.style.display = 'block';
+      
+      if (cooldownTimer) clearTimeout(cooldownTimer);
+      cooldownTimer = setTimeout(() => {
+        state.cooldownActive = false;
+        fireBtn.classList.remove('cooldown');
+        cooldownDisplay.style.display = 'none';
+        cooldownTimer = null;
+      }, SHOOT_COOLDOWN);
+    }
+
+    function canShoot() {
+      return !state.cooldownActive && (Date.now() - state.lastShootTime >= SHOOT_COOLDOWN);
+    }
+
     function setupJoystick() {
       const start = (e) => {
         e.preventDefault();
+        if (state.gameOver) return;
         joystickActive = true;
         const rect = joystickBase.getBoundingClientRect();
         joystickCenter = {
@@ -332,15 +488,22 @@
       window.addEventListener('mouseup', end);
     }
 
-    // ---------- DISPARO / AUTO-AIM ----------
-    fireBtn.addEventListener('touchstart', (e) => { e.preventDefault(); firing = true; });
+    fireBtn.addEventListener('touchstart', (e) => { 
+      e.preventDefault(); 
+      firing = true; 
+      if (canShoot()) shoot();
+    });
     fireBtn.addEventListener('touchend', () => firing = false);
-    fireBtn.addEventListener('mousedown', (e) => { e.preventDefault(); firing = true; });
+    fireBtn.addEventListener('mousedown', (e) => { 
+      e.preventDefault(); 
+      firing = true; 
+      if (canShoot()) shoot();
+    });
     fireBtn.addEventListener('mouseup', () => firing = false);
 
     function getClosestEnemy() {
       let closest = null;
-      let minDist = 330; // rango auto-aim
+      let minDist = 400;
       enemies.forEach(enemy => {
         const d = Math.hypot(enemy.x - player.x, enemy.y - player.y);
         if (d < minDist) {
@@ -352,35 +515,35 @@
     }
 
     function shoot() {
-      if (state.ammo <= 0 || state.gameOver) return;
-
+      if (state.ammo <= 0 || state.gameOver || !canShoot()) return;
+      
       const target = getClosestEnemy();
       if (target) {
         player.angle = Math.atan2(target.y - player.y, target.x - player.x);
       }
-
+      
       state.ammo--;
       updateAmmoDisplay();
+      startCooldown();
 
       bullets.push({
-        x: player.x + Math.cos(player.angle) * 18,
-        y: player.y + Math.sin(player.angle) * 18,
-        vx: Math.cos(player.angle) * 9,
-        vy: Math.sin(player.angle) * 9,
+        x: player.x + Math.cos(player.angle) * 20,
+        y: player.y + Math.sin(player.angle) * 20,
+        vx: Math.cos(player.angle) * 11,
+        vy: Math.sin(player.angle) * 11,
         isPlayer: true
       });
 
       floatingTexts.push({
-        x: player.x + Math.cos(player.angle) * 22,
-        y: player.y + Math.sin(player.angle) * 22,
+        x: player.x + Math.cos(player.angle) * 24,
+        y: player.y + Math.sin(player.angle) * 24,
         text: '💥',
         color: '#ffaa00',
-        size: 12,
-        life: 10
+        size: 15,
+        life: 12
       });
     }
 
-    // ---------- LOOT ----------
     lootBtn.addEventListener('click', () => collectLoot());
     lootBtn.addEventListener('touchstart', (e) => { e.preventDefault(); collectLoot(); });
 
@@ -394,7 +557,7 @@
         x: player.x, y: player.y - 14,
         text: `+${loot.amount} AMMO`,
         color: '#f1c40f',
-        size: 13,
+        size: 15,
         life: 25
       });
 
@@ -407,44 +570,21 @@
       document.getElementById('ammoCount').textContent = state.ammo;
     }
 
-    // ---------- EXTRACCIÓN Y OLEADAS ----------
-    function spawnEnemyWave(count = 2) {
-      for (let i = 0; i < count; i++) {
-        const angle = Math.random() * Math.PI * 2;
-        const dist = 180 + Math.random() * 140;
-        let ex = extractionZone.x + Math.cos(angle) * dist;
-        let ey = extractionZone.y + Math.sin(angle) * dist;
-        ex = Math.max(40, Math.min(state.mapW-40, ex));
-        ey = Math.max(40, Math.min(state.mapH-40, ey));
-        enemies.push({
-          x: ex, y: ey,
-          hp: 50,
-          maxHp: 50,
-          speed: 0.9 + Math.random() * 0.5,
-          radius: 12
-        });
-      }
-    }
-
     function updateExtraction() {
       const distToZone = Math.hypot(player.x - extractionZone.x, player.y - extractionZone.y);
       const insideZone = distToZone < extractionZone.radius;
 
       if (insideZone && !state.gameOver && state.hp > 0) {
         state.extracting = true;
-        state.extractProgress += 0.45; // ~15 segundos para 100%
+        state.extractProgress += 0.3;
         if (state.extractProgress >= 100) {
           state.extractProgress = 100;
           state.victory = true;
           state.gameOver = true;
         }
-        // Oleadas mientras extraes
-        if (Math.random() < 0.025 && enemies.length < 8) {
-          spawnEnemyWave(1);
-        }
       } else {
         state.extracting = false;
-        state.extractProgress = Math.max(0, state.extractProgress - 0.8);
+        state.extractProgress = Math.max(0, state.extractProgress - 0.5);
       }
 
       document.getElementById('extractDisplay').textContent = 
@@ -453,20 +593,63 @@
         (state.extracting && !state.gameOver) ? 'block' : 'none';
     }
 
-    // ---------- LÓGICA PRINCIPAL ----------
+    function drawMinimap() {
+      minimapCtx.clearRect(0, 0, 100, 100);
+      minimapCtx.fillStyle = '#0d110d';
+      minimapCtx.fillRect(0, 0, 100, 100);
+      
+      const scaleX = 100 / state.mapW;
+      const scaleY = 100 / state.mapH;
+      
+      vegetation.forEach(v => {
+        minimapCtx.fillStyle = v.type === 'tree' ? '#1a5c1a' : '#2d7a2d';
+        minimapCtx.fillRect(v.x * scaleX - 0.8, v.y * scaleY - 0.8, 1.6, 1.6);
+      });
+      
+      minimapCtx.fillStyle = '#ffaa00';
+      minimapCtx.beginPath();
+      minimapCtx.arc(extractionZone.x * scaleX, extractionZone.y * scaleY, 5, 0, 2*Math.PI);
+      minimapCtx.fill();
+      minimapCtx.strokeStyle = '#ffffff';
+      minimapCtx.lineWidth = 1.5;
+      minimapCtx.stroke();
+      
+      minimapCtx.fillStyle = '#f1c40f';
+      lootDrops.forEach(l => {
+        minimapCtx.fillRect(l.x * scaleX - 1.2, l.y * scaleY - 1.2, 2.4, 2.4);
+      });
+      
+      minimapCtx.fillStyle = '#e74c3c';
+      enemies.forEach(e => {
+        minimapCtx.beginPath();
+        minimapCtx.arc(e.x * scaleX, e.y * scaleY, 2.5, 0, 2*Math.PI);
+        minimapCtx.fill();
+      });
+      
+      minimapCtx.fillStyle = '#4caf50';
+      minimapCtx.beginPath();
+      minimapCtx.arc(player.x * scaleX, player.y * scaleY, 4, 0, 2*Math.PI);
+      minimapCtx.fill();
+      minimapCtx.strokeStyle = '#ffffff';
+      minimapCtx.lineWidth = 2;
+      minimapCtx.stroke();
+      
+      minimapCtx.strokeStyle = '#5a6b5a';
+      minimapCtx.lineWidth = 2;
+      minimapCtx.strokeRect(0, 0, 100, 100);
+    }
+
     function update() {
       if (state.gameOver || state.hp <= 0) {
         if (state.hp <= 0) state.gameOver = true;
         return;
       }
 
-      // Movimiento jugador
       player.x += player.vx * player.speed;
       player.y += player.vy * player.speed;
       player.x = Math.max(18, Math.min(state.mapW - 18, player.x));
       player.y = Math.max(18, Math.min(state.mapH - 18, player.y));
 
-      // Rotación automática
       const target = getClosestEnemy();
       if (target) {
         player.angle = Math.atan2(target.y - player.y, target.x - player.x);
@@ -474,17 +657,15 @@
         player.angle = Math.atan2(player.vy, player.vx);
       }
 
-      // Disparo continuo
-      if (firing && Date.now() - lastShotTime > 160 && state.ammo > 0) {
+      if (firing && canShoot() && state.ammo > 0) {
         shoot();
-        lastShotTime = Date.now();
       }
 
-      // Cámara suave
       camera.x = player.x - (W / (2 * state.zoom));
       camera.y = player.y - (H / (2 * state.zoom));
 
-      // Balas
+      updateEnemySpawning();
+
       for (let i = bullets.length-1; i >= 0; i--) {
         const b = bullets[i];
         b.x += b.vx;
@@ -498,14 +679,14 @@
         if (b.isPlayer) {
           for (let j = enemies.length-1; j >= 0; j--) {
             const e = enemies[j];
-            if (Math.hypot(e.x - b.x, e.y - b.y) < e.radius + 3) {
-              e.hp -= 22;
-              floatingTexts.push({ x: e.x, y: e.y-10, text: '-22', color: '#ff5555', size:12, life:14 });
+            if (Math.hypot(e.x - b.x, e.y - b.y) < e.radius + 4) {
+              e.hp -= 35;
+              floatingTexts.push({ x: e.x, y: e.y-10, text: '-35', color: '#ff5555', size:14, life:16 });
               bullets.splice(i,1);
               if (e.hp <= 0) {
                 lootDrops.push({
                   x: e.x, y: e.y,
-                  amount: 8 + Math.floor(Math.random() * 14)
+                  amount: 10 + Math.floor(Math.random() * 20)
                 });
                 enemies.splice(j,1);
               }
@@ -515,7 +696,6 @@
         }
       }
 
-      // Enemigos IA simple
       enemies.forEach(e => {
         const dx = player.x - e.x;
         const dy = player.y - e.y;
@@ -524,75 +704,87 @@
           e.x += (dx/dist) * e.speed;
           e.y += (dy/dist) * e.speed;
         }
-        if (dist < 22 && state.hp > 0) {
-          state.hp -= 0.4;
+        if (dist < 28 && state.hp > 0) {
+          state.hp -= 0.7;
           if (state.hp <= 0) state.hp = 0;
         }
       });
 
-      // Loot cercano
       activeLootIndex = -1;
       for (let i = 0; i < lootDrops.length; i++) {
-        if (Math.hypot(player.x - lootDrops[i].x, player.y - lootDrops[i].y) < 38) {
+        if (Math.hypot(player.x - lootDrops[i].x, player.y - lootDrops[i].y) < 45) {
           activeLootIndex = i;
           break;
         }
       }
       lootBtn.style.display = (activeLootIndex !== -1 && !state.gameOver) ? 'flex' : 'none';
 
-      // Extracción
       updateExtraction();
-
-      // Actualizar UI
       document.getElementById('hpFill').style.width = `${(state.hp/state.maxHp)*100}%`;
     }
 
-    // ---------- RENDERIZADO ----------
     function draw() {
       ctx.clearRect(0, 0, W, H);
       ctx.save();
       ctx.scale(state.zoom, state.zoom);
       ctx.translate(-camera.x, -camera.y);
 
-      // Fondo
-      ctx.fillStyle = '#1e2b1a';
+      ctx.fillStyle = '#1a2318';
       ctx.fillRect(0, 0, state.mapW, state.mapH);
-      ctx.strokeStyle = '#2f3a2a';
-      ctx.lineWidth = 1;
-      for (let i = 0; i < state.mapW; i += 45) {
+      
+      ctx.strokeStyle = '#28331f';
+      ctx.lineWidth = 0.8;
+      for (let i = 0; i < state.mapW; i += 50) {
         ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,state.mapH); ctx.stroke();
       }
-      for (let j = 0; j < state.mapH; j += 45) {
+      for (let j = 0; j < state.mapH; j += 50) {
         ctx.beginPath(); ctx.moveTo(0,j); ctx.lineTo(state.mapW,j); ctx.stroke();
       }
 
-      // Zona de extracción
+      vegetation.forEach(v => {
+        if (v.type === 'tree') {
+          ctx.fillStyle = '#2d5a1e';
+          ctx.beginPath();
+          ctx.arc(v.x, v.y, v.radius, 0, Math.PI*2);
+          ctx.fill();
+          ctx.fillStyle = '#1f4015';
+          ctx.beginPath();
+          ctx.arc(v.x, v.y, v.radius * 0.7, 0, Math.PI*2);
+          ctx.fill();
+        } else {
+          ctx.fillStyle = '#3a6b2a';
+          ctx.beginPath();
+          ctx.arc(v.x, v.y, v.radius, 0, Math.PI*2);
+          ctx.fill();
+        }
+      });
+
       ctx.beginPath();
       ctx.arc(extractionZone.x, extractionZone.y, extractionZone.radius, 0, Math.PI*2);
-      ctx.fillStyle = state.extracting ? '#ffaa0033' : '#ffaa0011';
+      ctx.fillStyle = state.extracting ? '#ffaa0040' : '#ffaa0015';
       ctx.fill();
       ctx.strokeStyle = '#ffaa00';
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = 3;
+      ctx.setLineDash([8, 6]);
       ctx.stroke();
+      ctx.setLineDash([]);
       ctx.fillStyle = '#ffaa00';
-      ctx.font = 'bold 13px Arial';
-      ctx.fillText('🚁 EXTRACCIÓN', extractionZone.x-55, extractionZone.y-28);
+      ctx.font = 'bold 14px Arial';
+      ctx.fillText('🚁 EXTRACCIÓN', extractionZone.x-62, extractionZone.y-32);
 
-      // Loot
       lootDrops.forEach(l => {
         ctx.fillStyle = '#d4a017';
         ctx.fillRect(l.x-9, l.y-9, 18, 18);
         ctx.fillStyle = '#000';
-        ctx.font = 'bold 8px Arial';
-        ctx.fillText('📦', l.x-8, l.y+3);
+        ctx.font = 'bold 9px Arial';
+        ctx.fillText('📦', l.x-8, l.y+4);
       });
 
-      // Enemigos
       enemies.forEach(e => {
         const isTarget = (getClosestEnemy() === e);
         if (isTarget) {
           ctx.beginPath();
-          ctx.arc(e.x, e.y, 18, 0, 2*Math.PI);
+          ctx.arc(e.x, e.y, 19, 0, 2*Math.PI);
           ctx.strokeStyle = '#ff4d4d';
           ctx.lineWidth = 2;
           ctx.stroke();
@@ -601,51 +793,47 @@
         ctx.beginPath(); ctx.arc(e.x, e.y, e.radius, 0, 2*Math.PI); ctx.fill();
         ctx.fillStyle = '#c0392b';
         ctx.beginPath(); ctx.arc(e.x, e.y, 5, 0, 2*Math.PI); ctx.fill();
-        // HP bar
         ctx.fillStyle = '#111';
         ctx.fillRect(e.x-13, e.y-19, 26, 5);
         ctx.fillStyle = '#e74c3c';
         ctx.fillRect(e.x-13, e.y-19, 26*(e.hp/e.maxHp), 5);
       });
 
-      // Balas
       bullets.forEach(b => {
         ctx.fillStyle = '#ffcc00';
-        ctx.beginPath(); ctx.arc(b.x, b.y, 2.5, 0, 2*Math.PI); ctx.fill();
+        ctx.beginPath(); ctx.arc(b.x, b.y, 3, 0, 2*Math.PI); ctx.fill();
       });
 
-      // Jugador
       ctx.save();
       ctx.translate(player.x, player.y);
       ctx.rotate(player.angle);
+      
       ctx.fillStyle = '#2c3e50';
       ctx.beginPath(); ctx.arc(0, 0, player.radius, 0, 2*Math.PI); ctx.fill();
       ctx.fillStyle = '#5d6d7e';
-      ctx.fillRect(6, -2, 16, 4); // rifle
+      ctx.fillRect(6, -2, 22, 5);
       ctx.fillStyle = '#4caf50';
       ctx.beginPath(); ctx.arc(0, 0, 6, 0, 2*Math.PI); ctx.fill();
       ctx.restore();
 
-      // Textos flotantes
       floatingTexts.forEach((ft, i) => {
         ctx.fillStyle = ft.color;
         ctx.font = `bold ${ft.size}px Arial`;
         ctx.fillText(ft.text, ft.x, ft.y);
-        ft.y -= 0.5;
+        ft.y -= 0.7;
         ft.life--;
       });
       floatingTexts = floatingTexts.filter(ft => ft.life > 0);
 
       ctx.restore();
 
-      // Pantalla final
       if (state.gameOver) {
-        ctx.fillStyle = 'rgba(0,0,0,0.75)';
+        ctx.fillStyle = 'rgba(0,0,0,0.85)';
         ctx.fillRect(0,0,W,H);
         ctx.fillStyle = state.victory ? '#ffd700' : '#e74c3c';
-        ctx.font = 'bold 28px Arial';
+        ctx.font = 'bold 34px Arial';
         ctx.textAlign = 'center';
-        ctx.fillText(state.victory ? 'EXTRAÍDO' : 'ELIMINADO', W/2, H/2-20);
+        ctx.fillText(state.victory ? '¡EXTRAÍDO!' : 'ELIMINADO', W/2, H/2-20);
         ctx.font = '16px Arial';
         ctx.fillText(state.victory ? 'Helicóptero asegurado' : 'Intenta de nuevo', W/2, H/2+30);
       }
@@ -654,6 +842,7 @@
     function gameLoop() {
       update();
       draw();
+      drawMinimap();
       requestAnimationFrame(gameLoop);
     }
 
